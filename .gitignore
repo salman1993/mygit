@@ -1,4 +1,5 @@
-test_dir/
+test_dir1/
+test_dir2/
 
 # Python-generated files
 __pycache__/
