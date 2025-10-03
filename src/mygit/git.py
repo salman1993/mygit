@@ -1,6 +1,7 @@
 import sys
 import os
 import argparse
+from typing import Optional
 import zlib
 from pathlib import Path
 from dataclasses import dataclass
@@ -9,6 +10,8 @@ import struct
 import difflib
 import functools
 import operator
+import time
+
 
 @dataclass
 class Object:
@@ -56,6 +59,8 @@ def init(repo_dir: str) -> None:
     for f in ["config", "HEAD"]:
         gitdir.joinpath(f).touch()
 
+    gitdir.joinpath("HEAD").write_text("ref: refs/heads/main")
+
     print(f"Initialized empty Git repository in {gitdir}")
 
 
@@ -88,9 +93,25 @@ def _zlib_compress(obj: Object, output_path: Path):
 def _zlib_decompress(input_path: Path) -> Object:
     compressed_data = input_path.read_bytes()
     decompressed = zlib.decompress(compressed_data)
-    header, body = decompressed.split(b"\0", 2)
-    typ, size = header.decode().split(" ")
-    return Object(type=typ, size=int(size), content=body)
+    nul_index = decompressed.index(b"\x00")
+    header = decompressed[:nul_index]
+    typ, size_str = header.decode().split()
+    size = int(size_str)
+    data = decompressed[nul_index + 1 :]
+    assert size == len(data), "expected size {}, got {} bytes".format(size, len(data))
+    return Object(type=typ, size=int(size), content=data)
+
+
+def _read_tree_entries(content: bytes) -> list[tuple[int, str, bytes]]:
+    """Reads tree entries from the tree object content."""
+    entries = []
+    while content:
+        inul = content.index(b"\x00")
+        mode, path = content[:inul].decode().split()
+        sha1 = content[inul + 1 : inul + 21]  # SHA1 hashes are 20 bytes
+        entries.append((int(mode), path, sha1))
+        content = content[inul + 21 :]
+    return entries
 
 
 @check_gitdir
@@ -102,21 +123,28 @@ def cat_file(t: bool, s: bool, p: bool, obj_hash: str):
     elif s:
         print(obj.size)
     elif p:
-        print(obj.content.decode())
+        if obj.type == "tree":
+            tree_entries = _read_tree_entries(obj.content)
+            for mode, path, sha1 in tree_entries:
+                # we always print blob here cause we don't allow subdirectories to be added
+                print(f"{mode:o} blob {sha1.hex()} {path}")
+        else:
+            print(obj.content.decode())
     else:
         print("Unknown type")
         sys.exit(1)
 
 
-def _hash_object(typ: str, filepath: str) -> str:
-    content = Path(filepath).read_bytes()
-    obj = Object(type=typ, size=len(content), content=content)
-    return compute_digest(obj)
-
-
 @check_gitdir
-def hash_object(typ: str, filepath: str, should_write: bool):
-    content = Path(filepath).read_bytes()
+def hash_object(
+    typ: str,
+    content: Optional[bytes] = None,
+    filepath: Optional[str] = None,
+    should_write: bool = True,
+):
+    assert content or filepath, "Either content or filepath must be provided."
+    if content is None:
+        content = Path(filepath).read_bytes()
     obj = Object(type=typ, size=len(content), content=content)
     digest = compute_digest(obj)
     if should_write:
@@ -124,7 +152,8 @@ def hash_object(typ: str, filepath: str, should_write: bool):
         dirpath.mkdir(exist_ok=True)
         output_path = dirpath.joinpath(digest[2:])
         _zlib_compress(obj, output_path=output_path)
-        print(f"Saved zlib compressed file at {output_path}")
+        # print(f"Saved zlib compressed file at {output_path}")
+    return digest
 
 
 def read_index() -> list[IndexEntry]:
@@ -173,6 +202,7 @@ def write_index(entries: list[IndexEntry]):
     # git index format: https://manpages.ubuntu.com/manpages/plucky/man5/gitformat-index.5.html
     # The first 12 bytes are the header, the last 20 a SHA-1 hash of the index, and the bytes in between are index entries, each 62 bytes plus the length of the path and some padding.
     header = signature + int.to_bytes(version) + int.to_bytes(num_entries)
+    header = struct.pack("!4sLL", signature, version, num_entries)
     packed_entries: list[bytes] = []
     for e in entries:
         packed = (
@@ -214,23 +244,41 @@ def add(filepaths: list[str]):
 
     for path in filepaths:
         if not Path(path).exists():
-           print(f"File {path} does not exist")
-           sys.exit(1)
+            print(f"File {path} does not exist")
+            sys.exit(1)
+
+        if len(Path(path).parts) > 1:
+            print(
+                "This simplified git CLI does not support adding files in a subdirectory; only root directory files are supported."
+            )
+            # this requires traversing filepaths bottom-up, i.e, from the deepest directories up to root (depth doesn’t really matter: we just want to see each directory before its parent)
+            # https://wyag.thb.lt/#cmd-commit
+            sys.exit(1)
 
         # add or overwrite the file to the index
-        sha1 = _hash_object(typ='blob', filepath=path)
+        sha1 = hash_object(typ="blob", filepath=path, should_write=True)
         st = os.stat(path)
         flags = len(path.encode())
         assert flags < (1 << 12)
         entry = IndexEntry(
-                int(st.st_ctime), 0, int(st.st_mtime), 0, st.st_dev,
-                st.st_ino, st.st_mode, st.st_uid, st.st_gid, st.st_size,
-                bytes.fromhex(sha1), flags, path)
+            int(st.st_ctime),
+            0,
+            int(st.st_mtime),
+            0,
+            st.st_dev,
+            st.st_ino,
+            st.st_mode,
+            st.st_uid,
+            st.st_gid,
+            st.st_size,
+            bytes.fromhex(sha1),
+            flags,
+            path,
+        )
         entries.append(entry)
 
-    entries.sort(key=operator.attrgetter('path'))
+    entries.sort(key=operator.attrgetter("path"))
     write_index(entries)
-
 
 
 @check_gitdir
@@ -266,37 +314,70 @@ def _cwd_filepaths() -> list[Path]:
     return paths
 
 
-def _compare_cwd_files_to_index() -> tuple[list[Path], list[Path], list[Path]]:
+def _latest_commit_filepaths() -> list[Path]:
+    commit_hash = get_latest_commit_hash()
+
+    if commit_hash is None:
+        return []
+
+    # read the commit object & get the tree sha
+    objpath = _obj_path(commit_hash)
+    obj = _zlib_decompress(objpath)
+    assert obj.type == "commit", "should be commit"
+    first_line = obj.content.decode().split("\n")[0]
+    typ, tree_hash = first_line.split()
+    assert typ == "tree", "type of first line in commit should be tree"
+
+    # then read the tree object & its entries
+    objpath = _obj_path(tree_hash)
+    obj = _zlib_decompress(objpath)
+    tree_entries = _read_tree_entries(obj.content)
+    paths = [Path(t[1]) for t in tree_entries]
+    return paths
+
+
+def _compare_cwd_files_to_index() -> tuple[
+    list[Path], list[Path], list[Path], list[Path]
+]:
     """Returns the deleted, modified, untracked file paths. We don't show newly added files.
 
     Untracked files: Files that exist in the working directory but are not in the index at all
-    Added files: Files that are in the index (staged) but weren't in the previous commit
+    Added files: Files that are in the index (staged) but weren't in the most recent commit
     """
     index_entries = read_index()
     index_paths = set([Path(e.path) for e in index_entries])
     cwd_paths = set(_cwd_filepaths())
+    latest_commit_paths = set(_latest_commit_filepaths())
 
     untracked = cwd_paths - index_paths
     deleted = index_paths - cwd_paths
     overlapping = index_paths & cwd_paths
+    added = index_paths - latest_commit_paths
 
     modified: list[Path] = []
     index_path_hash = {e.path: e.sha1 for e in index_entries}
     for p in overlapping:
-        curr_hash = _hash_object(typ="blob", filepath=str(p))
+        curr_hash = hash_object(typ="blob", filepath=str(p), should_write=False)
         prev_hash = index_path_hash[str(p)].hex()
         if curr_hash != prev_hash:
             modified.append(p)
 
-    return sorted(list(deleted)), sorted(list(modified)), sorted(list(untracked))
+    return (
+        sorted(list(deleted)),
+        sorted(list(modified)),
+        sorted(list(added)),
+        sorted(list(untracked)),
+    )
 
 
 @check_gitdir
 def status():
-    deleted, modified, untracked = _compare_cwd_files_to_index()
+    deleted, modified, added, untracked = _compare_cwd_files_to_index()
 
     for p in deleted:
         print(f"deleted:   {str(p)}")
+    for p in added:
+        print(f"new:       {str(p)}")
     for p in modified:
         print(f"modified:  {str(p)}")
 
@@ -308,9 +389,9 @@ def status():
 
 @check_gitdir
 def diff():
-    deleted, modified, _ = _compare_cwd_files_to_index()
+    deleted, modified, added, _ = _compare_cwd_files_to_index()
     entries = {e.path: e for e in read_index()}
-    for p in deleted + modified:
+    for p in deleted + added + modified:
         curr_content = p.read_text().splitlines()
         index_obj_hash = entries[str(p)].sha1.hex()
         objpath = _obj_path(index_obj_hash)
@@ -324,11 +405,56 @@ def diff():
             tofile=f"{p} - current",
         )
 
-        for l in diff_lines:
-            print(l)
+        for line in diff_lines:
+            print(line)
 
         print("-" * 60)
         print()
+
+
+def _write_tree_object():
+    """Writes the current index entries as a tree object, as part of the commit"""
+    entries = []
+    for ie in read_index():
+        tree_entry = f"{ie.mode:o} {ie.path}".encode() + b"\0" + ie.sha1
+        entries.append(tree_entry)
+    content = b"".join(entries)
+    digest = hash_object(typ="tree", content=content, should_write=True)
+    return digest
+
+
+def get_latest_commit_hash() -> Optional[str]:
+    try:
+        return Path(".git/refs/heads/main").read_text()
+    except Exception:
+        return None
+
+
+@check_gitdir
+def commit(msg: str, author: str):
+    tree = _write_tree_object()
+    parent = get_latest_commit_hash()
+
+    timestamp = int(time.time())
+    utc_offset_seconds = time.localtime().tm_gmtoff
+    offset_hours = abs(utc_offset_seconds) // 3600
+    offset_minutes = (abs(utc_offset_seconds) // 60) % 60
+    author_time = f"{timestamp} {'-' if utc_offset_seconds < 0 else '+'}{offset_hours:02d}{offset_minutes:02d}"
+
+    lines = [f"tree {tree}"]
+    if parent:
+        lines.append(f"parent {parent}")
+    lines.append(f"author {author} {author_time}")
+    lines.append(f"committer {author} {author_time}")
+    lines.append("")
+    lines.append(msg)
+    lines.append("")
+
+    content = "\n".join(lines).encode()
+    digest = hash_object(typ="commit", content=content, should_write=True)
+    Path(".git/refs/heads/main").write_text(digest)
+    print("committed to main branch: {:7}".format(digest))
+    return digest
 
 
 def main() -> None:
@@ -386,30 +512,36 @@ def main() -> None:
     )
 
     # add
+    sp = subparsers.add_parser("add", help="Add file contents to the index")
+    sp.add_argument("filepaths", nargs="+", help="File paths to add")
+
+    # commit
     sp = subparsers.add_parser(
-        "add", help="Add file contents to the index"
+        "commit",
+        help="Create a new commit containing the current contents of the index and the given log message describing the changes.",
     )
-    sp.add_argument("filepaths", nargs='+',  help="File paths to add")
+    sp.add_argument("-m", "--msg", type=str, required=True)
+    sp.add_argument("-a", "--author", type=str, default="Salman <salman@example.com>")
 
     args = parser.parse_args()
 
     match args.command:
         case "init":
-            return init(repo_dir=args.directory)
+            init(repo_dir=args.directory)
         case "cat-file":
-            return cat_file(t=args.t, s=args.s, p=args.p, obj_hash=args.object)
+            cat_file(t=args.t, s=args.s, p=args.p, obj_hash=args.object)
         case "hash-object":
-            return hash_object(
-                typ=args.type, filepath=args.file, should_write=args.write
-            )
+            hash_object(typ=args.type, filepath=args.file, should_write=args.write)
         case "ls-files":
             ls_files(stage=args.stage, debug=args.debug)
         case "status":
-            return status()
+            status()
         case "diff":
-            return diff()
+            diff()
         case "add":
-            return add(args.filepaths)
+            add(args.filepaths)
+        case "commit":
+            commit(args.msg, args.author)
         case _:
             print("Unknown command")
             sys.exit(1)
